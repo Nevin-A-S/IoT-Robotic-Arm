@@ -14,7 +14,36 @@ from src.controller.servo_controller import ServoControl
 from src.detector.object_detector import ObjectDetector
 from src.utils.logger import get_logger
 
+import json
+from datetime import datetime
+from kafka import KafkaProducer
+
 logger = get_logger(__name__)
+
+class SafeProducer:
+    def __init__(self, bootstrap_servers='localhost:9092'):
+        self.producer = None
+        try:
+            self.producer = KafkaProducer(
+                bootstrap_servers=bootstrap_servers,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                request_timeout_ms=1000,
+                api_version_auto_timeout_ms=1000
+            )
+            logger.info("Kafka Producer initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Kafka Producer: {e}. Running in standalone mode.")
+
+    def send(self, topic, data):
+        if self.producer:
+            try:
+                # Add timestamp if not present
+                if 'timestamp' not in data:
+                    data['timestamp'] = datetime.utcnow().isoformat()
+                self.producer.send(topic, data)
+            except Exception as e:
+                logger.warning(f"Failed to send Kafka message: {e}")
+
 
 
 class RoboticArmController:
@@ -32,25 +61,26 @@ class RoboticArmController:
         logger.debug("Object Detector initialized successfully.")
 
         logger.debug(f"Initializing Servo Control at port {SERVO_PORT} ...")
-        self.servo_control = ServoControl(COM=SERVO_PORT)
-        self.center_threshold = CENTER_THRESHOLD
+        try:
+            self.servo_control = ServoControl(COM=SERVO_PORT)
+            logger.info("Servo Control initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Servo Control: {e}")
+            if "PermissionError" in str(e) or "Access is denied" in str(e):
+                logger.error(f"PORT {SERVO_PORT} is likely in use by another process. Please close any other applications using this port.")
+            self.servo_control = None
+        
+        self.producer = SafeProducer()
+        self.robot_id = "robot_1"
         self.frame_width = CAMER_WIDTH
         self.frame_height = CAMERA_HEIGHT
-
-        if self.camera.isOpened():
-            self.frame_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.frame_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            logger.info(
-                f"Camera initialized with resolution: {self.frame_width}x{self.frame_height}"
-            )
-        else:
-            logger.error("Failed to open camera")
-            raise RuntimeError("Failed to open camera")
-
-        logger.info("Servo Control initialized successfully.")
+        self.center_threshold = CENTER_THRESHOLD
 
     def get_distance(self) -> str | None:
         """Get distance from ultrasonic sensor."""
+        if not self.servo_control:
+            return None
+            
         try:
             self.servo_control.ser.write("DIST\n".encode("utf-8"))
             time.sleep(0.1)
@@ -60,6 +90,10 @@ class RoboticArmController:
                 if response.startswith("DISTC"):
                     distance = int(response[5:])
                     logger.info(f"Distance measured: {distance}cm")
+                    self.producer.send("robot_telemetry", {
+                        "robot_id": self.robot_id,
+                        "distance": distance
+                    })
                     return distance
             return None
         except Exception as e:
@@ -86,10 +120,12 @@ class RoboticArmController:
 
         if distance_from_center > 0:
             logger.info("Moving base servo right")
-            self.servo_control.baseServoRight()
+            if self.servo_control:
+                self.servo_control.baseServoRight()
         else:
             logger.info("Moving base servo left")
-            self.servo_control.baseServoLeft()
+            if self.servo_control:
+                self.servo_control.baseServoLeft()
 
         return False
 
@@ -99,6 +135,10 @@ class RoboticArmController:
         args:
             distance (int): Distance to the object in cm.
         """
+        if not self.servo_control:
+            logger.warning("Servo control not initialized, skipping pickup sequence")
+            return False
+
         try:
             distance_str = str(int(distance))
 
@@ -299,12 +339,25 @@ class RoboticArmController:
                         detections.sort(key=lambda x: x.confidence, reverse=True)
                         target_bbox = detections[0]
                         object_class = target_bbox.class_name
+                        
+                        self.producer.send("robot_events", {
+                            "robot_id": self.robot_id,
+                            "event_type": "detection",
+                            "object_class": object_class,
+                            "details": f"Detected {object_class}"
+                        })
 
                         if self.center_object(target_bbox):
                             distance = self.get_distance()
                             if distance is not None:
                                 executing_sequence = True
                                 logger.info("Starting pickup and disposal sequence")
+                                self.producer.send("robot_events", {
+                                    "robot_id": self.robot_id,
+                                    "event_type": "pickup_start",
+                                    "object_class": object_class,
+                                    "details": "Starting pickup sequence"
+                                })
 
                                 try:
                                     if self.execute_pickup_sequence(
@@ -313,10 +366,22 @@ class RoboticArmController:
                                         logger.info(
                                             "Pickup and disposal sequence completed successfully"
                                         )
+                                        self.producer.send("robot_events", {
+                                            "robot_id": self.robot_id,
+                                            "event_type": "pickup_success",
+                                            "object_class": object_class,
+                                            "details": "Pickup successful"
+                                        })
                                     else:
                                         logger.warning(
                                             "Pickup and disposal sequence failed"
                                         )
+                                        self.producer.send("robot_events", {
+                                            "robot_id": self.robot_id,
+                                            "event_type": "pickup_fail",
+                                            "object_class": object_class,
+                                            "details": "Pickup failed"
+                                        })
                                 finally:
                                     executing_sequence = False
                                     logger.info(

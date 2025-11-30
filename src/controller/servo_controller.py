@@ -84,10 +84,10 @@ class ServoControl:
         logger.info("Servo moved sucessfully")
 
     def closeGripper(self):
-        self.moveServoSingle(5, 10)
+        self.moveServoSingle(5, 40)
 
     def openGripper(self):
-        self.moveServoSingle(5, 105)
+        self.moveServoSingle(5, 100)
 
     def setCircle(self, circle: str):
         self.moveServoBatch(self.positionData[circle])
